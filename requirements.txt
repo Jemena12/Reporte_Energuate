@@ -1,0 +1,14 @@
+# Reporte Diario Guatecrédito - Dependencias
+# Python 3.8+
+
+# Base de datos
+pymongo>=4.0.0
+
+# Datos y Excel
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# Gráficos e imágenes
+matplotlib>=3.7.0
+Pillow>=10.0.0
+numpy>=1.24.0

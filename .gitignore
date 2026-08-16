@@ -1,0 +1,44 @@
+# ============================================================
+# Informes Guatecrédito — .gitignore
+# ============================================================
+
+# Entorno virtual / dependencias locales
+venv/
+.venv/
+env/
+ENV/
+
+# Envío automático y tareas programadas (launchd)
+launchd/
+*.plist
+
+# Salidas generadas por los reportes
+reportes/
+.mplconfig/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editores / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Excel temporales / backups locales
+~$*
+*_tmp*.xlsx
+reporte_general (*).xlsx
