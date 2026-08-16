@@ -12,8 +12,12 @@ ENV/
 launchd/
 *.plist
 
-# Salidas generadas por los reportes
-reportes/
+# Salidas generadas por los reportes (excepto ejemplos/archivos a versionar)
+reportes/**
+!reportes/2026-08-15/
+!reportes/2026-08-15/**
+!reportes/excel_acumulado/
+!reportes/excel_acumulado/reporte_mora_2026-05-15.xlsx
 .mplconfig/
 
 # Python
