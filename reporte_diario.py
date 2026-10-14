@@ -22,6 +22,7 @@ from openpyxl.utils import get_column_letter
 from datetime import datetime, timedelta, timezone
 import shutil
 import json
+import unicodedata
 
 def add_logo(ax, logo, x, y, zoom=0.22):
     """Añade el logo al eje solo si logo no es None."""
@@ -163,6 +164,88 @@ def _iso_rango_desde_fecha(fecha_str: str) -> tuple[str, str]:
     )
 
 
+CORTE_PENDIENTES = "2026-10-08"
+_EXACTOS_PENDIENTE = ("no estaban en base de datos", "no estaba en base de datos")
+_FRASE_RENAP = "ocurrio un error al realizar la validacion contra renap"
+_FRASE_CONSULTAR = "ocurrio un error al momento de consultar tu"
+
+
+def _normalizar_texto(texto: str) -> str:
+    """Minúsculas, sin tildes y sin espacios de más."""
+    base = unicodedata.normalize("NFD", str(texto or ""))
+    sin_tilde = "".join(c for c in base if unicodedata.category(c) != "Mn")
+    return " ".join(sin_tilde.strip().lower().split()).rstrip(".")
+
+
+def _motivos_y_cupo(doc: dict) -> tuple[list[str], bool]:
+    motivos = []
+    cupo = False
+    variables = (doc.get("additional_data") or {}).get("variables_data") or []
+    if not isinstance(variables, list):
+        return motivos, cupo
+    for item in variables:
+        clave = str(item.get("key") or "").strip().lower()
+        valor = str(item.get("value") or "").strip()
+        if clave in ("motivos_negacion", "motivonegacion") and valor and valor not in motivos:
+            motivos.append(valor)
+        if clave == "montoaprobado":
+            cupo = valor not in ("", "0", "None")
+    return motivos, cupo
+
+
+def _clasificar_lead(fecha: str, motivos: list[str], lead_status: str, cupo: bool) -> str | None:
+    """Clasifica un lead según la fecha de solicitud y el motivo de negación.
+
+    Hasta el 08/10/2026, pendiente es el texto exacto de no estar en base de
+    datos, el error de Renap o el error al consultar. Desde el 09/10/2026,
+    pendiente es solo Renap o el error al consultar. El NIS que no está en la
+    BBDD sigue en rechazos BD.
+    """
+    normas = [texto for texto in (_normalizar_texto(m) for m in motivos) if texto]
+
+    def es_pendiente(texto: str) -> bool:
+        if any(frase in texto for frase in _EXACTOS_PENDIENTE):
+            return fecha <= CORTE_PENDIENTES
+        if _FRASE_RENAP in texto or _FRASE_CONSULTAR in texto:
+            return True
+        return False
+
+    if any(es_pendiente(texto) for texto in normas):
+        return "pendientes"
+    if any("bbdd" in texto or "no se encuentra en la base de datos" in texto for texto in normas):
+        return "bd"
+    if any("politic" in texto or "ainova" in texto for texto in normas):
+        return "politicas"
+    if str(lead_status or "") == "new" and not cupo and not normas:
+        return "inconclusas"
+    return None
+
+
+def _contar_clasificacion(lead_col, inicio_iso: str, fin_iso: str, fecha_unica: str | None = None) -> dict:
+    """Cuenta inconclusas, BD, pendientes y políticas entre dos instantes UTC."""
+    conteo = {"inconclusas": 0, "bd": 0, "pendientes": 0, "politicas": 0}
+    for doc in lead_col.find(
+        {"ecosystem": ECOSYSTEM_ID, "created_at": {"$gte": inicio_iso, "$lte": fin_iso}},
+        {"created_at": 1, "lead_status": 1, "additional_data.variables_data": 1},
+    ):
+        if fecha_unica:
+            fecha = fecha_unica
+        else:
+            texto_fecha = str(doc.get("created_at") or "").replace("Z", "+00:00")
+            try:
+                cuando = datetime.fromisoformat(texto_fecha)
+            except ValueError:
+                continue
+            if cuando.tzinfo is None:
+                cuando = cuando.replace(tzinfo=timezone.utc)
+            fecha = cuando.astimezone(GUATE_TZ).strftime("%Y-%m-%d")
+        motivos, cupo = _motivos_y_cupo(doc)
+        tipo = _clasificar_lead(fecha, motivos, doc.get("lead_status"), cupo)
+        if tipo in conteo:
+            conteo[tipo] += 1
+    return conteo
+
+
 def calcular_metricas_dia(
     fecha_str: str,
     lead_col,
@@ -174,13 +257,10 @@ def calcular_metricas_dia(
     """Métricas de un día desde Mongo (misma lógica que el informe diario)."""
     inicio_d, fin_d = _iso_rango_desde_fecha(fecha_str)
 
-    prospectos_nuevos = lead_col.count_documents({
+    aprobados = users_col.count_documents({
         "ecosystem": ECOSYSTEM_ID,
         "created_at": {"$gte": inicio_d, "$lte": fin_d},
-    })
-    clientes_nuevos = users_col.count_documents({
-        "ecosystem": ECOSYSTEM_ID,
-        "created_at": {"$gte": inicio_d, "$lte": fin_d},
+        "quota": {"$gt": 0},
     })
 
     pipeline_loans = [
@@ -206,32 +286,26 @@ def calcular_metricas_dia(
     no_desembolsos = data_loans["no_desembolsos"]
     monto_desembolsado = data_loans["monto_desembolsado"] / 100
     ticket_promedio = round(monto_desembolsado / desembolsos, 2) if desembolsos else 0
-    total_solicitudes = prospectos_nuevos + clientes_nuevos
-
-    pipeline_rechazos = [
-        {"$match": {
-            "ecosystem": ECOSYSTEM_ID,
-            "created_at": {"$gte": inicio_d, "$lte": fin_d},
-        }},
-        {"$unwind": "$additional_data.variables_data"},
-        {"$match": {"additional_data.variables_data.key": {"$in": ["motivos_negacion", "motivoNegacion"]}}},
-        {"$group": {"_id": "$additional_data.variables_data.value", "cantidad": {"$sum": 1}}},
-    ]
-    rechazo_politicas = 0
-    for r in lead_col.aggregate(pipeline_rechazos):
-        motivo = (r["_id"] or "").lower()
-        if ("no cumple" in motivo or "identificación" in motivo or "nis" in motivo or "lista negra" in motivo):
-            rechazo_politicas += r["cantidad"]
-
-    rechazos_bd = prospectos_nuevos - rechazo_politicas
+    clasificacion = _contar_clasificacion(lead_col, inicio_d, fin_d, fecha_str)
+    inconclusas = clasificacion["inconclusas"]
+    rechazos_bd = clasificacion["bd"]
+    pendientes = clasificacion["pendientes"]
+    rechazo_politicas = clasificacion["politicas"]
+    clientes_nuevos = aprobados + rechazos_bd + pendientes + rechazo_politicas
+    total_solicitudes = clientes_nuevos + inconclusas
     cab, mab, clab = abonos_por_dia.get(fecha_str, (0, 0.0, 0))
     can, _man = anulados_por_dia.get(fecha_str, (0, 0.0))
 
     return {
         "Fecha": fecha_str,
         "Solicitudes": total_solicitudes,
-        "Rechazos - BD": rechazos_bd,
+        "Solicitudes inconclusas": inconclusas,
         "Clientes nuevos": clientes_nuevos,
+        "Rechazos BD": rechazos_bd,
+        "Clientes aprobados": aprobados,
+        "Clientes pendientes": pendientes,
+        "Rechazos políticas": rechazo_politicas,
+        "Rechazos - BD": rechazos_bd,
         "Rechazos - Políticas": rechazo_politicas,
         "Créditos nuevos": creditos_nuevos,
         "Desembolsos": desembolsos,
@@ -440,18 +514,147 @@ users_col = db[USERS_COLLECTION]
 payments_col = db[PAYMENT_COLLECTION]
 deleted_loans_col = db[DELETED_LOAN_COLLECTION]
 
+_periodo_desde = os.environ.get("REPORTE_DESDE", "").strip()
+_periodo_hasta = os.environ.get("REPORTE_HASTA", "").strip()
+if _periodo_desde and _periodo_hasta:
+    _ini_p, _ = _iso_rango_desde_fecha(_periodo_desde)
+    _, _fin_p = _iso_rango_desde_fecha(_periodo_hasta)
+    _prospectos_p = 0
+    _politicas_p = 0
+    _bd_p = 0
+    _filas_lead = []
+    for _doc in lead_col.find(
+        {"ecosystem": ECOSYSTEM_ID, "created_at": {"$gte": _ini_p, "$lte": _fin_p}},
+        {"_id": 1, "name": 1, "lastname": 1, "nit": 1, "created_at": 1, "additional_data.variables_data": 1},
+    ):
+        _prospectos_p += 1
+        _variables = (_doc.get("additional_data") or {}).get("variables_data") or []
+        _motivo = ""
+        _nis = ""
+        if isinstance(_variables, list):
+            for _item in _variables:
+                _key = str(_item.get("key") or "").strip().lower()
+                _valor = str(_item.get("value") or "").strip()
+                if _key in ("motivos_negacion", "motivonegacion") and _valor and not _motivo:
+                    _motivo = _valor
+                if _key == "nis" and _valor and not _nis:
+                    _nis = _valor
+        _texto_fecha_lead = str(_doc.get("created_at") or "").replace("Z", "+00:00")
+        try:
+            _cuando_lead = datetime.fromisoformat(_texto_fecha_lead)
+        except ValueError:
+            _cuando_lead = None
+        if _cuando_lead is not None and _cuando_lead.tzinfo is None:
+            _cuando_lead = _cuando_lead.replace(tzinfo=timezone.utc)
+        _fecha_lead = _cuando_lead.astimezone(GUATE_TZ).strftime("%Y-%m-%d") if _cuando_lead else _periodo_desde
+        _cupo_lead = False
+        if isinstance(_variables, list):
+            for _item in _variables:
+                if str(_item.get("key") or "").strip().lower() == "montoaprobado":
+                    _cupo_lead = str(_item.get("value") or "").strip() not in ("", "0", "None")
+        _tipo = _clasificar_lead(_fecha_lead, [_motivo] if _motivo else [], _doc.get("lead_status"), _cupo_lead)
+        if _tipo == "politicas":
+            _politicas_p += 1
+        elif _tipo == "bd":
+            _bd_p += 1
+        elif _tipo is None or _tipo == "inconclusas":
+            _texto_fecha = str(_doc.get("created_at") or "").replace("Z", "+00:00")
+            _dt = datetime.fromisoformat(_texto_fecha)
+            if _dt.tzinfo is None:
+                _dt = _dt.replace(tzinfo=timezone.utc)
+            _nombre = f"{(_doc.get('name') or '').strip()} {(_doc.get('lastname') or '').strip()}".strip()
+            _filas_lead.append({
+                "Fecha": _dt.astimezone(GUATE_TZ).strftime("%Y-%m-%d"),
+                "Id": str(_doc.get("_id") or ""),
+                "Nombre": _nombre,
+                "DPI": str(_doc.get("nit") or "").strip(),
+                "NIS": _nis,
+            })
+    _filas_lead.sort(key=lambda fila: (fila["Fecha"], fila["Nombre"], fila["DPI"]))
+    _clientes_p = users_col.count_documents({
+        "ecosystem": ECOSYSTEM_ID,
+        "created_at": {"$gte": _ini_p, "$lte": _fin_p},
+    })
+    _leads_p = len(_filas_lead)
+    _solicitudes_p = _bd_p + _politicas_p + _clientes_p
+    _carpeta_p = os.path.join(BASE_DIR, f"{_periodo_desde}_a_{_periodo_hasta}")
+    os.makedirs(_carpeta_p, exist_ok=True)
+    _archivo_detalle = os.path.join(_carpeta_p, f"detalle_lead_{_periodo_desde}_a_{_periodo_hasta}.xlsx")
+    pd.DataFrame(_filas_lead, columns=["Fecha", "Id", "Nombre", "DPI", "NIS"]).to_excel(
+        _archivo_detalle, index=False
+    )
+    _archivo_img = os.path.join(_carpeta_p, f"reporte_{_periodo_desde}_a_{_periodo_hasta}.png")
+    fig, ax = plt.subplots(figsize=(6, 8))
+    ax.axis("off")
+    ax.text(0.5, 0.92, "REPORTE", ha="center", fontsize=18, weight="bold")
+    ax.text(0.5, 0.86, f"Desde: {_periodo_desde} hasta: {_periodo_hasta}", ha="center", fontsize=11)
+    add_logo(ax, logo, 0.08, 0.95)
+    add_logo(ax, logo, 0.92, 0.95)
+    for _y, (_etiq, _val) in zip(
+        (0.72, 0.64, 0.56, 0.48, 0.40),
+        (
+            ("lead", _leads_p),
+            ("Solicitudes", _solicitudes_p),
+            ("Rechazos - BD", _bd_p),
+            ("Clientes nuevos", _clientes_p),
+            ("Rechazos - Políticas", _politicas_p),
+        ),
+    ):
+        ax.text(0.10, _y, _etiq, fontsize=12, weight="bold")
+        ax.text(0.80, _y, str(_val), ha="right", fontsize=12)
+    plt.subplots_adjust(top=0.92)
+    plt.savefig(_archivo_img, dpi=300)
+    plt.close()
+    print(
+        f"[Periodo] lead {_leads_p} | solicitudes {_solicitudes_p} | "
+        f"BD {_bd_p} | clientes {_clientes_p} | políticas {_politicas_p}"
+    )
+    _msg_p = EmailMessage()
+    _msg_p["Subject"] = f"Reporte Guatecrédito {_periodo_desde} a {_periodo_hasta}"
+    _msg_p["From"] = EMAIL_REMITENTE
+    _msg_p["To"] = ", ".join(EMAIL_DESTINO)
+    _msg_p.set_content(
+        f"Reporte del {_periodo_desde} al {_periodo_hasta}.\n\n"
+        f"- lead: {_leads_p}\n"
+        f"- Solicitudes: {_solicitudes_p}\n"
+        f"- Rechazos - BD: {_bd_p}\n"
+        f"- Clientes nuevos: {_clientes_p}\n"
+        f"- Rechazos - Políticas: {_politicas_p}\n\n"
+        "Solicitudes = rechazos de base de datos + rechazos de políticas + clientes nuevos.\n"
+        "lead = motivo de negación vacío o texto \"Sin motivos\".\n"
+        "El Excel detalle_lead trae el id, el nombre, el DPI y el NIS de cada lead."
+    )
+    with open(_archivo_img, "rb") as _f:
+        _msg_p.add_attachment(_f.read(), maintype="image", subtype="png", filename="reporte_septiembre.png")
+    with open(_archivo_detalle, "rb") as _f:
+        _msg_p.add_attachment(
+            _f.read(),
+            maintype="application",
+            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=f"detalle_lead_{_periodo_desde}_a_{_periodo_hasta}.xlsx",
+        )
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=SMTP_TIMEOUT_SEC) as _smtp:
+        _smtp.login(EMAIL_REMITENTE, EMAIL_PASSWORD)
+        _smtp.send_message(_msg_p)
+    print("✔ Envío de correo realizado correctamente")
+    raise SystemExit(0)
+
 # ======================================================
 # 4–6. MÉTRICAS DEL DÍA (y barrido de ayer si el informe es de hoy)
 # ======================================================
 
-prospectos_acumulados = lead_col.count_documents({
+clasificacion_acum = _contar_clasificacion(lead_col, inicio_acum_iso, fin_acum_iso)
+inconclusas_acum = clasificacion_acum["inconclusas"]
+rechazos_bd_acum = clasificacion_acum["bd"]
+pendientes_acum = clasificacion_acum["pendientes"]
+rechazo_politicas_acum = clasificacion_acum["politicas"]
+aprobados_acum = users_col.count_documents({
     "ecosystem": ECOSYSTEM_ID,
-    "created_at": {"$gte": inicio_acum_iso, "$lte": fin_acum_iso}
+    "created_at": {"$gte": inicio_acum_iso, "$lte": fin_acum_iso},
+    "quota": {"$gt": 0},
 })
-clientes_acumulados = users_col.count_documents({
-    "ecosystem": ECOSYSTEM_ID,
-    "created_at": {"$gte": inicio_acum_iso, "$lte": fin_acum_iso}
-})
+clientes_acumulados = aprobados_acum + rechazos_bd_acum + pendientes_acum + rechazo_politicas_acum
+solicitudes_acumuladas = clientes_acumulados + inconclusas_acum
 
 pipeline_loans_acum = [
     {"$match": {
@@ -481,25 +684,6 @@ clientes_abonados_unicos_acum = _clientes_abonados_unicos_periodo(
     payments_col, ECOSYSTEM_ID, inicio_acum_iso, fin_iso
 )
 
-pipeline_rechazos_acum = [
-    {"$match": {
-        "ecosystem": ECOSYSTEM_ID,
-        "created_at": {"$gte": inicio_acum_iso, "$lte": fin_acum_iso}
-    }},
-    {"$unwind": "$additional_data.variables_data"},
-    {"$match": {"additional_data.variables_data.key": {"$in": ["motivos_negacion", "motivoNegacion"]}}},
-    {"$group": {"_id": "$additional_data.variables_data.value", "cantidad": {"$sum": 1}}}
-]
-resultados_rechazos_acum = list(lead_col.aggregate(pipeline_rechazos_acum))
-rechazo_politicas_acum = 0
-for r in resultados_rechazos_acum:
-    motivo = (r["_id"] or "").lower()
-    cantidad = r["cantidad"]
-    if ("no cumple" in motivo or "identificación" in motivo or "nis" in motivo or "lista negra" in motivo):
-        rechazo_politicas_acum += cantidad
-
-solicitudes_acumuladas = prospectos_acumulados + clientes_acumulados
-rechazos_bd_acum = prospectos_acumulados - rechazo_politicas_acum
 
 # ======================================================
 # 6c. PAGOS / ABONOS (colección payment) — por día Guatemala, rango acumulado
@@ -528,10 +712,13 @@ filas_excel.append(calcular_metricas_dia(
 ))
 
 metricas_dia = filas_excel[-1]
+inconclusas = metricas_dia["Solicitudes inconclusas"]
 total_solicitudes = metricas_dia["Solicitudes"]
-rechazos_bd = metricas_dia["Rechazos - BD"]
+rechazos_bd = metricas_dia["Rechazos BD"]
+aprobados = metricas_dia["Clientes aprobados"]
+pendientes = metricas_dia["Clientes pendientes"]
 clientes_nuevos = metricas_dia["Clientes nuevos"]
-rechazo_politicas = metricas_dia["Rechazos - Políticas"]
+rechazo_politicas = metricas_dia["Rechazos políticas"]
 creditos_nuevos = metricas_dia["Créditos nuevos"]
 desembolsos = metricas_dia["Desembolsos"]
 no_desembolsos = metricas_dia["No desembolsos"]
@@ -600,9 +787,36 @@ else:
 df_final = df_final.copy()
 
 # Asegurar columnas y rellenarlas para todas las fechas (histórico)
-for col in ("# de abonos recibidos", "# de clientes abonados", "Monto abonos", "Créditos anulados"):
+for col in ("# de abonos recibidos", "# de clientes abonados", "Monto abonos", "Créditos anulados", "lead"):
     if col not in df_final.columns:
         df_final[col] = 0
+df_final["lead"] = pd.to_numeric(df_final["lead"], errors="coerce").fillna(0)
+df_final = df_final.drop(columns=["Desistimiento en tienda"], errors="ignore")
+
+orden_columnas = [
+    "Fecha",
+    "Solicitudes",
+    "Solicitudes inconclusas",
+    "Clientes nuevos",
+    "Rechazos BD",
+    "Clientes aprobados",
+    "Clientes pendientes",
+    "Rechazos políticas",
+    "Rechazos - BD",
+    "Rechazos - Políticas",
+    "Créditos nuevos",
+    "Desembolsos",
+    "No desembolsos",
+    "Monto desembolsado",
+    "Ticket promedio",
+    "# de abonos recibidos",
+    "# de clientes abonados",
+    "Monto abonos",
+    "Créditos anulados",
+]
+columnas_presentes = [col for col in orden_columnas if col in df_final.columns]
+columnas_extra = [col for col in df_final.columns if col not in columnas_presentes]
+df_final = df_final[columnas_presentes + columnas_extra]
 
 for idx in df_final.index:
     f = df_final.at[idx, "Fecha"]
@@ -718,42 +932,43 @@ add_logo(ax, logo, 0.92, 0.95)
 
 labels = [
     "Solicitudes",
-    "Rechazos - BD",
+    "Solicitudes inconclusas",
     "Clientes nuevos",
-    "Rechazos - Políticas",
+    "Rechazos BD",
+    "Clientes aprobados",
+    "Clientes pendientes",
+    "Rechazos políticas",
     "Créditos nuevos",
-    "Desembolsos",
-    "No desembolsos",
     "Monto desembolsado",
     "Ticket promedio",
     "# de abonos recibidos",
     "# de clientes abonados",
-    "Monto abonos",
-    "Créditos anulados"
-    
+    "Monto abonados",
+    "Créditos anulados",
 ]
 
 values = [
     total_solicitudes,
-    rechazos_bd,
+    inconclusas,
     clientes_nuevos,
+    rechazos_bd,
+    aprobados,
+    pendientes,
     rechazo_politicas,
     creditos_nuevos,
-    desembolsos,
-    no_desembolsos,
     f"Q{monto_desembolsado:,.2f}",
     f"Q{ticket_promedio:,.2f}",
     cantidad_abonos,
     clientes_abonados_dia,
     f"Q{monto_abonos:,.2f}",
-    creditos_anulados
+    creditos_anulados,
 ]
 
-y = 0.72
+y = 0.78
 for label, value in zip(labels, values):
-    ax.text(0.10, y, label, fontsize=11, weight="bold")
-    ax.text(0.80, y, str(value), ha="right", fontsize=11)
-    y -= 0.06
+    ax.text(0.10, y, label, fontsize=10, weight="bold")
+    ax.text(0.80, y, str(value), ha="right", fontsize=10)
+    y -= 0.052
 
 imagen_diaria = os.path.join(
     CARPETA_DIA,
@@ -765,33 +980,11 @@ plt.savefig(imagen_diaria, dpi=300)
 plt.close()
 
 # ======================================================
-# IMAGEN ACUMULADO (sumas desde Excel acumulado)
+# IMAGEN ACUMULADO
 # ======================================================
 
 fig, ax = plt.subplots(figsize=(6,8))
 ax.axis("off")
-
-# Totales acumulados basados en el Excel (df_final)
-df_acum = df_final.copy()
-try:
-    df_acum["Fecha"] = pd.to_datetime(df_acum["Fecha"], errors="coerce").dt.strftime("%Y-%m-%d")
-except Exception:
-    pass
-df_acum = df_acum.dropna(subset=["Fecha"])
-df_acum = df_acum[df_acum["Fecha"] <= FECHA_CONSULTA].sort_values("Fecha")
-
-def _sum_col(name: str) -> float:
-    return float(pd.to_numeric(df_acum.get(name), errors="coerce").fillna(0).sum())
-
-solicitudes_acumuladas = int(_sum_col("Solicitudes"))
-rechazos_bd_acum = int(_sum_col("Rechazos - BD"))
-clientes_acumulados = int(_sum_col("Clientes nuevos"))
-rechazo_politicas_acum = int(_sum_col("Rechazos - Políticas"))
-creditos_acumulados = int(_sum_col("Créditos nuevos"))
-desembolsos_acumulados = int(_sum_col("Desembolsos"))
-no_desembolsos_acumulados = int(_sum_col("No desembolsos"))
-monto_desembolsado_acum = _sum_col("Monto desembolsado")
-ticket_promedio_acum = round(monto_desembolsado_acum / desembolsos_acumulados, 2) if desembolsos_acumulados else 0
 
 # TITULO
 ax.text(0.5, 0.96, "ACUMULADO", ha="center", fontsize=18, weight="bold")
@@ -803,41 +996,43 @@ add_logo(ax, logo, 0.92, 0.95)
 
 labels_acum = [
     "Solicitudes",
-    "Rechazos - BD",
+    "Solicitudes inconclusas",
     "Clientes nuevos",
-    "Rechazos - Políticas",
+    "Rechazos BD",
+    "Clientes aprobados",
+    "Clientes pendientes",
+    "Rechazos políticas",
     "Créditos nuevos",
-    "Desembolsos",
-    "No desembolsos",
     "Monto desembolsado",
     "Ticket promedio",
     "# de abonos recibidos",
     "# de clientes abonados",
     "Monto abonos",
-    "Créditos anulados"
+    "Créditos anulados",
 ]
 
 values_acum = [
     solicitudes_acumuladas,
-    rechazos_bd_acum,
+    inconclusas_acum,
     clientes_acumulados,
+    rechazos_bd_acum,
+    aprobados_acum,
+    pendientes_acum,
     rechazo_politicas_acum,
     creditos_acumulados,
-    desembolsos_acumulados,
-    no_desembolsos_acumulados,
     f"Q{monto_desembolsado_acum:,.2f}",
     f"Q{ticket_promedio_acum:,.2f}",
-    int(_sum_col("# de abonos recibidos")),
-    clientes_abonados_unicos_acum,
-    f"Q{_sum_col('Monto abonos'):,.2f}",
-    int(_sum_col("Créditos anulados"))
+    int(sum(v[0] for v in ABONOS_POR_DIA.values())),
+    int(sum(v[2] for v in ABONOS_POR_DIA.values())),
+    f"Q{sum(v[1] for v in ABONOS_POR_DIA.values()):,.2f}",
+    int(sum(v[0] for v in ANULADOS_POR_DIA.values())),
 ]
 
-y = 0.72
+y = 0.74
 for label, value in zip(labels_acum, values_acum):
-    ax.text(0.10, y, label, fontsize=11, weight="bold")
-    ax.text(0.80, y, str(value), ha="right", fontsize=11)
-    y -= 0.06
+    ax.text(0.10, y, label, fontsize=10, weight="bold")
+    ax.text(0.80, y, str(value), ha="right", fontsize=10)
+    y -= 0.048
 
 imagen_acumulada = os.path.join(
     CARPETA_DIA,
